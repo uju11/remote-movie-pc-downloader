@@ -5,10 +5,23 @@ import re
 import asyncio
 import httpx
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 
 # Load environment variables
 load_dotenv()
+
+# Pending interactive search selections map
+PENDING_SEARCHES = {}
+
+def format_size(size_bytes: int) -> str:
+    if not size_bytes:
+        return ""
+    if size_bytes >= 1073741824:
+        return f"{size_bytes / 1073741824:.2f} GB"
+    elif size_bytes >= 1048576:
+        return f"{size_bytes / 1048576:.1f} MB"
+    return f"{size_bytes} B"
+
 
 # Setup logging
 logging.basicConfig(
@@ -278,10 +291,55 @@ async def search_and_download_telegram(client: TelegramClient, movie_name: str, 
 
 
 # --- Telegram Command Listener Event Handler Setup ---
+# --- Telegram Command Listener Event Handler Setup ---
 def setup_handlers(client: TelegramClient, me_id: int = None):
+
+    async def execute_download(reply_msg, torrent):
+        magnet_link = torrent.get('MagnetUri') or torrent.get('Link')
+        title = torrent.get('Title')
+        seeders = torrent.get('Seeders', 0)
+        
+        await reply_msg.edit(
+            f"📥 Selected torrent ({seeders} seeders):\n`{title}`\n\nAdding to qBittorrent...",
+            buttons=None
+        )
+        
+        qb = QBittorrentClient(QBITTORRENT_URL, QBITTORRENT_USERNAME, QBITTORRENT_PASSWORD)
+        success = await qb.add_torrent(magnet_link, DOWNLOAD_DIR)
+        await qb.close()
+        
+        if success:
+            await reply_msg.edit(
+                f"✅ Successfully added torrent to qBittorrent:\n`{title}`\n\nSaving to: `{DOWNLOAD_DIR}`",
+                buttons=None
+            )
+        else:
+            await reply_msg.edit("⚠️ Failed to push torrent to qBittorrent.", buttons=None)
+
+    @client.on(events.CallbackQuery)
+    async def handle_callback(event):
+        data = event.data.decode('utf-8')
+        chat_id = event.chat_id
+        
+        if data == "cancel":
+            if chat_id in PENDING_SEARCHES:
+                del PENDING_SEARCHES[chat_id]
+            await event.edit("❌ Search cancelled.", buttons=None)
+            return
+
+        if data.startswith("sel_"):
+            idx = int(data.split("_")[1])
+            pending = PENDING_SEARCHES.get(chat_id)
+            if pending and idx < len(pending.get("results", [])):
+                selected_torrent = pending["results"][idx]
+                reply_msg = pending["reply_msg"]
+                del PENDING_SEARCHES[chat_id]
+                await execute_download(reply_msg, selected_torrent)
+            else:
+                await event.edit("⚠️ Selection expired. Please search again.", buttons=None)
+
     @client.on(events.NewMessage(pattern=r'(?i).+'))
     async def handle_new_message(event):
-        # Strictly restrict to private messages sent by yourself (e.g. in Saved Messages)
         if not event.is_private:
             return
             
@@ -291,6 +349,20 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
         text = event.message.text.strip()
         if not text:
             return
+
+        chat_id = event.chat_id
+
+        # Check if user replied with a selection number (1-5) for a pending search
+        if text.isdigit() and chat_id in PENDING_SEARCHES:
+            idx = int(text) - 1
+            pending = PENDING_SEARCHES[chat_id]
+            results = pending.get("results", [])
+            if 0 <= idx < len(results):
+                selected_torrent = results[idx]
+                reply_msg = pending["reply_msg"]
+                del PENDING_SEARCHES[chat_id]
+                await execute_download(reply_msg, selected_torrent)
+                return
 
         # Simple parsing for "Movie Name ::: Quality" or just "Movie Name"
         quality = None
@@ -310,38 +382,46 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             await reply_msg.edit(f"🔍 Searching Jackett for torrents...")
             torrent_results = await search_jackett(movie_name, quality)
             
-            best_torrent = None
-            if torrent_results:
-                # Sort by seeders descending
-                torrent_results.sort(key=lambda x: x.get('Seeders', 0), reverse=True)
-                top_result = torrent_results[0]
-                seeders = top_result.get('Seeders', 0)
-                logging.info(f"Top Jackett result: '{top_result.get('Title')}' with {seeders} seeders.")
-                
-                # Check seeder count threshold
-                if seeders > 10:
-                    best_torrent = top_result
+            # Filter and sort results
+            valid_results = [r for r in torrent_results if r.get('Seeders', 0) > 0]
+            valid_results.sort(key=lambda x: x.get('Seeders', 0), reverse=True)
+            
+            # Group or pick top 5 results
+            top_results = valid_results[:5]
 
-            if best_torrent:
-                magnet_link = best_torrent.get('MagnetUri') or best_torrent.get('Link')
-                title = best_torrent.get('Title')
-                seeders = best_torrent.get('Seeders', 0)
+            if len(top_results) == 1:
+                # Only 1 match found - download immediately
+                await execute_download(reply_msg, top_results[0])
+                return
+            elif len(top_results) > 1:
+                # Multiple matches found - prompt user to select
+                PENDING_SEARCHES[chat_id] = {
+                    "results": top_results,
+                    "reply_msg": reply_msg
+                }
+                
+                msg_lines = [f"🎬 **Multiple results found for '{movie_name}':**\n"]
+                buttons = []
+                number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+                
+                for idx, t in enumerate(top_results):
+                    title = t.get("Title", "Unknown")
+                    seeders = t.get("Seeders", 0)
+                    size_str = format_size(t.get("Size", 0))
+                    num = number_emojis[idx] if idx < len(number_emojis) else f"{idx+1}."
+                    
+                    msg_lines.append(f"{num} `{title}`\n   📊 {seeders} seeders | 💾 {size_str}\n")
+                    btn_label = f"{num} {title[:35]}..." if len(title) > 38 else f"{num} {title}"
+                    buttons.append([Button.inline(btn_label, data=f"sel_{idx}".encode('utf-8'))])
+                
+                buttons.append([Button.inline("❌ Cancel", data=b"cancel")])
+                msg_lines.append("👇 **Tap a button above or reply with a number (1-5) to select:**")
                 
                 await reply_msg.edit(
-                    f"📥 Found healthy torrent ({seeders} seeders):\n`{title}`\n\nAdding to qBittorrent..."
+                    "\n".join(msg_lines),
+                    buttons=buttons
                 )
-                
-                qb = QBittorrentClient(QBITTORRENT_URL, QBITTORRENT_USERNAME, QBITTORRENT_PASSWORD)
-                success = await qb.add_torrent(magnet_link, DOWNLOAD_DIR)
-                await qb.close()
-                
-                if success:
-                    await reply_msg.edit(
-                        f"✅ Successfully added torrent to qBittorrent:\n`{title}`\n\nSaving to: `{DOWNLOAD_DIR}`"
-                    )
-                    return
-                else:
-                    await reply_msg.edit("⚠️ Failed to push torrent to qBittorrent. Falling back to Telegram search...")
+                return
 
             # 2. Telegram Fallback Search
             await reply_msg.edit(f"⚠️ Torrent not found or low seeders. Searching Telegram fallback channels...")
@@ -350,7 +430,8 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             if downloaded_file:
                 filename = os.path.basename(downloaded_file)
                 await reply_msg.edit(
-                    f"✅ Successfully downloaded via Telegram fallback:\n`{filename}`\n\nSaved to: `{DOWNLOAD_DIR}`"
+                    f"✅ Successfully downloaded via Telegram fallback:\n`{filename}`\n\nSaved to: `{DOWNLOAD_DIR}`",
+                    buttons=None
                 )
                 return
 
@@ -361,16 +442,18 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             if suggestion:
                 await reply_msg.edit(
                     f"❌ No matches found for **{movie_name}**.\n\nDid you mean: **{suggestion}**?\n"
-                    f"Please try searching again with the corrected name."
+                    f"Please try searching again with the corrected name.",
+                    buttons=None
                 )
             else:
                 await reply_msg.edit(
-                    f"❌ No matches found for **{movie_name}** in Jackett or preconfigured Telegram channels."
+                    f"❌ No matches found for **{movie_name}** in Jackett or preconfigured Telegram channels.",
+                    buttons=None
                 )
 
         except Exception as e:
             logging.exception("Error during command execution:")
-            await reply_msg.edit(f"❌ An unexpected error occurred: {e}")
+            await reply_msg.edit(f"❌ An unexpected error occurred: {e}", buttons=None)
 
 
 async def main():
