@@ -1,0 +1,26 @@
+# Sensitive Environment Variables and Passwords
+.env
+*.env
+
+# Telegram Telethon Session files
+*.session
+*.session-journal
+
+# Application Config & Downloads Storage
+config/
+
+# Python compiled files and cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts (PyInstaller, etc)
+dist/
+build/
+*.spec
+
+# OS Generated Files
+Thumbs.db
+Desktop.ini
+.DS_Store

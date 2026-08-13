@@ -1,0 +1,77 @@
+version: '3.8'
+
+services:
+  # The Hybrid Downloader Bot Python Service
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: media_downloader_bot
+    restart: unless-stopped
+    depends_on:
+      - qbittorrent
+      - jackett
+    env_file:
+      - .env
+    environment:
+      # Override the download directory for container environment
+      - DOWNLOAD_DIR=/downloads
+      # Use internal docker networking URLs to communicate between services
+      - QBITTORRENT_URL=http://qbittorrent:8080
+      - JACKETT_URL=http://jackett:9117
+    volumes:
+      # Map the source directory to persist Telethon session files and debug logs
+      - .:/app
+      # Map the host download directory to /downloads in the container
+      - U:\movies:/downloads
+    # Interactive mode is enabled so we can input Telegram OTP during setup if running via CLI
+    stdin_open: true
+    tty: true
+
+  # qBittorrent client
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    container_name: qbittorrent
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Kolkata
+      - WEBUI_PORT=8080
+    ports:
+      - "8080:8080"
+      - "6881:6881"
+      - "6881:6881/udp"
+    volumes:
+      - ./config/qbittorrent:/config
+      - U:\movies:/downloads
+
+  # Jackett indexer aggregator
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    container_name: jackett
+    restart: unless-stopped
+    depends_on:
+      - flaresolverr
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Asia/Kolkata
+      - AUTO_UPDATE=true
+    ports:
+      - "9117:9117"
+    volumes:
+      - ./config/jackett:/config
+      - U:\movies:/downloads
+
+  # FlareSolverr to bypass Cloudflare anti-bot challenges
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: flaresolverr
+    restart: unless-stopped
+    environment:
+      - LOG_LEVEL=info
+      - TZ=Asia/Kolkata
+    ports:
+      - "8191:8191"
+
