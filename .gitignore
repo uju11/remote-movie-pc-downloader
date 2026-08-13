@@ -19,6 +19,7 @@ __pycache__/
 dist/
 build/
 *.spec
+*.exe
 
 # OS Generated Files
 Thumbs.db
