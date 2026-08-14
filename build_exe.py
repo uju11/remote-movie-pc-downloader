@@ -47,16 +47,28 @@ def build_executable():
         dist_exe = os.path.join(PROJECT_DIR, "dist", EXE_OUTPUT_NAME)
         target_exe = os.path.join(PROJECT_DIR, EXE_OUTPUT_NAME)
         if os.path.exists(dist_exe):
+            # Attempt to kill any running instance of the executable before copying
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", EXE_OUTPUT_NAME], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+            except Exception:
+                pass
+
             if os.path.exists(target_exe):
                 try:
                     os.remove(target_exe)
                 except Exception:
                     pass
             import shutil
-            shutil.copy(dist_exe, target_exe)
-            print("====================================================")
-            print(f"[SUCCESS] Executable created: {target_exe}")
-            print("====================================================")
+            try:
+                shutil.copy(dist_exe, target_exe)
+                print("====================================================")
+                print(f"[SUCCESS] Executable created & updated: {target_exe}")
+                print("====================================================")
+            except PermissionError:
+                print("====================================================")
+                print(f"[SUCCESS] Executable built at: {dist_exe}")
+                print(f"[NOTE] Could not overwrite root '{EXE_OUTPUT_NAME}' because it is currently running or locked.")
+                print("====================================================")
         else:
             print("[ERROR] Build completed but dist executable was not found.")
     else:

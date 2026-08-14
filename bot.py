@@ -22,6 +22,13 @@ def format_size(size_bytes: int) -> str:
         return f"{size_bytes / 1048576:.1f} MB"
     return f"{size_bytes} B"
 
+def extract_movie_key(title: str) -> str:
+    clean = re.sub(r'[\._\-\[\]\(\)]+', ' ', title)
+    clean = re.sub(r'\s+', ' ', clean).strip().lower()
+    return clean
+
+
+
 
 # Setup logging
 logging.basicConfig(
@@ -139,56 +146,44 @@ class QBittorrentClient:
 
 
 # --- Jackett Search Client ---
+async def fetch_single_jackett_query(client, url, q):
+    try:
+        params = {"apikey": JACKETT_API_KEY, "Query": q}
+        resp = await client.get(url, params=params, timeout=12.0)
+        if resp.status_code == 200:
+            res = resp.json().get("Results", [])
+            logging.info(f"Jackett query '{q}' returned {len(res)} results.")
+            return res
+    except Exception as e:
+        logging.error(f"Error querying Jackett for '{q}': {e}")
+    return []
+
 async def search_jackett(movie_name: str, quality: str = None) -> list:
     """
     Search Jackett for torrents matching movie_name and quality.
-    If no results are found for the combined query, it falls back to
-    searching just the movie name and filtering results locally.
     """
     if not JACKETT_API_KEY:
         logging.warning("JACKETT_API_KEY is not set. Skipping Jackett search.")
         return []
 
-    query = f"{movie_name} {quality}" if quality else movie_name
     url = f"{JACKETT_URL}/api/v2.0/indexers/all/results"
-    params = {
-        "apikey": JACKETT_API_KEY,
-        "Query": query
-    }
+    base_query = f"{movie_name} {quality}" if quality else movie_name
+    queries = [base_query]
     
-    results = []
-    logging.info(f"Searching Jackett for '{query}'...")
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(url, params=params)
-            if response.status_code == 200:
-                data = response.json()
-                results = data.get("Results", [])
-                logging.info(f"Jackett returned {len(results)} results for combined query.")
-            else:
-                logging.error(f"Jackett query failed with status {response.status_code}: {response.text}")
-    except Exception as e:
-        logging.error(f"Connection error to Jackett: {e}")
+    # If query is a general base title (e.g. 'Hotel Transylvania'), also search parts 1, 2, 3, 4 in parallel
+    if not re.search(r'\b(1|2|3|4|5|6|7|8|9|part|vol|chapter)\b', movie_name.lower()):
+        for sp in ["1", "2", "3", "4"]:
+            queries.append(f"{movie_name} {sp} {quality}" if quality else f"{movie_name} {sp}")
 
-    # Fallback search if no results found and a quality filter was specified
-    if not results and quality:
-        logging.info(f"No results for combined query. Searching Jackett for movie title '{movie_name}' with local filtering...")
-        params["Query"] = movie_name
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url, params=params)
-                if response.status_code == 200:
-                    raw_results = response.json().get("Results", [])
-                    quality_lower = quality.lower()
-                    results = [
-                        r for r in raw_results
-                        if quality_lower in r.get("Title", "").lower()
-                    ]
-                    logging.info(f"Found {len(results)} matches after filtering movie results for quality '{quality}'.")
-        except Exception as e:
-            logging.error(f"Connection error to Jackett during fallback search: {e}")
+    all_results = []
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        tasks = [fetch_single_jackett_query(client, url, q) for q in queries]
+        responses = await asyncio.gather(*tasks)
+        for r in responses:
+            all_results.extend(r)
 
-    return results
+    logging.info(f"Total combined Jackett results: {len(all_results)}")
+    return all_results
 
 
 # --- DuckDuckGo Spelling Suggestions ---
@@ -292,7 +287,54 @@ async def search_and_download_telegram(client: TelegramClient, movie_name: str, 
 
 # --- Telegram Command Listener Event Handler Setup ---
 # --- Telegram Command Listener Event Handler Setup ---
+# --- Telegram Command Listener Event Handler Setup ---
 def setup_handlers(client: TelegramClient, me_id: int = None):
+
+    async def schedule_auto_delete(message, delay_seconds=60):
+        await asyncio.sleep(delay_seconds)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    def render_page_content(results, movie_name, page_num=0, items_per_page=5):
+        total_items = len(results)
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+        page_num = max(0, min(page_num, total_pages - 1))
+        
+        start_idx = page_num * items_per_page
+        end_idx = min(start_idx + items_per_page, total_items)
+        page_items = results[start_idx:end_idx]
+        
+        msg_lines = [f"🎬 **Results for '{movie_name}' (Page {page_num + 1}/{total_pages}):**\n"]
+        buttons = []
+        
+        for i, t in enumerate(page_items):
+            item_idx = start_idx + i
+            title = t.get("Title", "Unknown")
+            seeders = t.get("Seeders", 0)
+            size_str = format_size(t.get("Size", 0))
+            display_num = item_idx + 1
+            
+            msg_lines.append(f"**{display_num}.** `{title}`\n   📊 {seeders} seeders | 💾 {size_str}\n")
+            btn_label = f"{display_num}. {title[:32]}..." if len(title) > 35 else f"{display_num}. {title}"
+            buttons.append([Button.inline(btn_label, data=f"sel_{item_idx}".encode('utf-8'))])
+            
+        nav_row = []
+        if page_num > 0:
+            nav_row.append(Button.inline("⏪ Prev", data=f"page_{page_num - 1}".encode('utf-8')))
+        nav_row.append(Button.inline("❌ Cancel", data=b"cancel"))
+        if page_num < total_pages - 1:
+            nav_row.append(Button.inline("Next ⏩", data=f"page_{page_num + 1}".encode('utf-8')))
+            
+        buttons.append(nav_row)
+        msg_lines.append(f"👇 **Reply with a number (1-{total_items}), or type:**")
+        msg_lines.append("• **`next`** (or **`n`**) -> Next Page")
+        msg_lines.append("• **`prev`** (or **`p`**) -> Previous Page")
+        msg_lines.append("• **`cancel`** -> Cancel Search")
+        msg_lines.append("\n⏱️ *Menu auto-deletes in 180 seconds.*")
+        
+        return "\n".join(msg_lines), buttons, page_num
 
     async def execute_download(reply_msg, torrent):
         magnet_link = torrent.get('MagnetUri') or torrent.get('Link')
@@ -309,10 +351,11 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
         await qb.close()
         
         if success:
-            await reply_msg.edit(
-                f"✅ Successfully added torrent to qBittorrent:\n`{title}`\n\nSaving to: `{DOWNLOAD_DIR}`",
+            done_msg = await reply_msg.edit(
+                f"✅ Successfully added torrent to qBittorrent:\n`{title}`\n\nSaving to: `{DOWNLOAD_DIR}`\n\n⏱️ *Message auto-deletes in 15 seconds.*",
                 buttons=None
             )
+            asyncio.create_task(schedule_auto_delete(done_msg, 15))
         else:
             await reply_msg.edit("⚠️ Failed to push torrent to qBittorrent.", buttons=None)
 
@@ -323,20 +366,42 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
         
         if data == "cancel":
             if chat_id in PENDING_SEARCHES:
+                timer = PENDING_SEARCHES[chat_id].get("timer")
+                if timer:
+                    timer.cancel()
                 del PENDING_SEARCHES[chat_id]
-            await event.edit("❌ Search cancelled.", buttons=None)
+            msg = await event.edit("❌ Search cancelled.", buttons=None)
+            asyncio.create_task(schedule_auto_delete(msg, 5))
+            return
+
+        if data.startswith("page_"):
+            page_num = int(data.split("_")[1])
+            pending = PENDING_SEARCHES.get(chat_id)
+            if pending:
+                results = pending.get("results", [])
+                movie_name = pending.get("movie_name", "")
+                text, buttons, new_page = render_page_content(results, movie_name, page_num)
+                pending["page"] = new_page
+                await event.edit(text, buttons=buttons)
+            else:
+                msg = await event.edit("⚠️ Selection expired. Please search again.", buttons=None)
+                asyncio.create_task(schedule_auto_delete(msg, 5))
             return
 
         if data.startswith("sel_"):
             idx = int(data.split("_")[1])
             pending = PENDING_SEARCHES.get(chat_id)
             if pending and idx < len(pending.get("results", [])):
+                timer = pending.get("timer")
+                if timer:
+                    timer.cancel()
                 selected_torrent = pending["results"][idx]
                 reply_msg = pending["reply_msg"]
                 del PENDING_SEARCHES[chat_id]
                 await execute_download(reply_msg, selected_torrent)
             else:
-                await event.edit("⚠️ Selection expired. Please search again.", buttons=None)
+                msg = await event.edit("⚠️ Selection expired. Please search again.", buttons=None)
+                asyncio.create_task(schedule_auto_delete(msg, 5))
 
     @client.on(events.NewMessage(pattern=r'(?i).+'))
     async def handle_new_message(event):
@@ -352,26 +417,97 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
 
         chat_id = event.chat_id
 
-        # Check if user replied with a selection number (1-5) for a pending search
-        if text.isdigit() and chat_id in PENDING_SEARCHES:
-            idx = int(text) - 1
+        # 0. DIRECT MAGNET LINK SUPPORT: e.g. "/magnet ::: magnet:?xt=..." or "magnet:?xt=..."
+        if "magnet:?xt=" in text or text.startswith("/magnet"):
+            magnet_link = text
+            if ":::" in text:
+                magnet_link = text.split(":::", 1)[1].strip()
+            
+            magnet_link = re.sub(r'^/magnet\s*', '', magnet_link).strip()
+            
+            reply_msg = await event.reply("📥 Adding magnet link directly to qBittorrent...")
+            qb = QBittorrentClient(QBITTORRENT_URL, QBITTORRENT_USERNAME, QBITTORRENT_PASSWORD)
+            success = await qb.add_torrent(magnet_link, DOWNLOAD_DIR)
+            await qb.close()
+            
+            if success:
+                done_msg = await reply_msg.edit(
+                    f"✅ Magnet link successfully added to qBittorrent!\nSaving to: `{DOWNLOAD_DIR}`\n\n⏱️ *Message auto-deletes in 15 seconds.*"
+                )
+                asyncio.create_task(schedule_auto_delete(done_msg, 15))
+            else:
+                await reply_msg.edit("❌ Failed to add magnet link to qBittorrent.")
+            return
+
+        # 1. PENDING SEARCH INTERACTIVE COMMANDS (Number selection, Next, Prev, Cancel)
+        if chat_id in PENDING_SEARCHES:
+            t_low = text.lower()
             pending = PENDING_SEARCHES[chat_id]
             results = pending.get("results", [])
-            if 0 <= idx < len(results):
-                selected_torrent = results[idx]
-                reply_msg = pending["reply_msg"]
-                del PENDING_SEARCHES[chat_id]
-                await execute_download(reply_msg, selected_torrent)
+            movie_name = pending.get("movie_name", "")
+            current_page = pending.get("page", 0)
+            reply_msg = pending.get("reply_msg")
+
+            if t_low in ("next", "n", ">", ">>"):
+                text_c, buttons_c, new_p = render_page_content(results, movie_name, current_page + 1)
+                pending["page"] = new_p
+                await reply_msg.edit(text_c, buttons=buttons_c)
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
                 return
 
-        # Simple parsing for "Movie Name ::: Quality" or just "Movie Name"
+            if t_low in ("prev", "p", "<", "<<"):
+                text_c, buttons_c, new_p = render_page_content(results, movie_name, current_page - 1)
+                pending["page"] = new_p
+                await reply_msg.edit(text_c, buttons=buttons_c)
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                return
+
+            if t_low in ("cancel", "c", "exit", "stop"):
+                timer = pending.get("timer")
+                if timer:
+                    timer.cancel()
+                del PENDING_SEARCHES[chat_id]
+                msg = await reply_msg.edit("❌ Search cancelled.", buttons=None)
+                asyncio.create_task(schedule_auto_delete(msg, 5))
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
+                return
+
+            if text.isdigit():
+                idx = int(text) - 1
+                if 0 <= idx < len(results):
+                    timer = pending.get("timer")
+                    if timer:
+                        timer.cancel()
+                    selected_torrent = results[idx]
+                    del PENDING_SEARCHES[chat_id]
+                    try:
+                        await event.delete()
+                    except Exception:
+                        pass
+                    await execute_download(reply_msg, selected_torrent)
+                    return
+
+        # Require ::: format to start a new search
+        if ":::" not in text:
+            return
+
+        # Parse "Movie Name ::: Quality" or "Movie Name ::: search"
+        parts = text.split(":::", 1)
+        movie_name = parts[0].strip()
+        raw_quality = parts[1].strip() if len(parts) > 1 else None
+        
         quality = None
-        if ":::" in text:
-            parts = text.split(":::", 1)
-            movie_name = parts[0].strip()
-            quality = parts[1].strip()
-        else:
-            movie_name = text
+        if raw_quality and raw_quality.lower() not in ("search", "all", "any", "full", "none", ""):
+            quality = raw_quality
 
         reply_msg = await event.reply(
             f"🔍 Processing query: **{movie_name}**" + (f" (Quality: {quality})" if quality else "") + "..."
@@ -382,43 +518,48 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             await reply_msg.edit(f"🔍 Searching Jackett for torrents...")
             torrent_results = await search_jackett(movie_name, quality)
             
-            # Filter and sort results
+            # Filter and sort results by seeders
             valid_results = [r for r in torrent_results if r.get('Seeders', 0) > 0]
             valid_results.sort(key=lambda x: x.get('Seeders', 0), reverse=True)
             
-            # Group or pick top 5 results
-            top_results = valid_results[:5]
+            # Deduplicate exact duplicate links while retaining all distinct releases/parts
+            distinct_results = []
+            seen_links = set()
+            for r in valid_results:
+                link = r.get("MagnetUri") or r.get("Link") or r.get("Title")
+                if link not in seen_links:
+                    seen_links.add(link)
+                    distinct_results.append(r)
+
+            top_results = distinct_results if distinct_results else valid_results
 
             if len(top_results) == 1:
                 # Only 1 match found - download immediately
                 await execute_download(reply_msg, top_results[0])
                 return
             elif len(top_results) > 1:
-                # Multiple matches found - prompt user to select
+                # Multiple matches found - render Paginated Menu with Next/Prev
+                text_content, buttons, current_page = render_page_content(top_results, movie_name, page_num=0)
+                
+                async def auto_delete_task():
+                    await asyncio.sleep(180)
+                    if chat_id in PENDING_SEARCHES and PENDING_SEARCHES[chat_id]["reply_msg"].id == reply_msg.id:
+                        del PENDING_SEARCHES[chat_id]
+                        try:
+                            await reply_msg.delete()
+                        except Exception:
+                            pass
+
                 PENDING_SEARCHES[chat_id] = {
                     "results": top_results,
-                    "reply_msg": reply_msg
+                    "movie_name": movie_name,
+                    "page": current_page,
+                    "reply_msg": reply_msg,
+                    "timer": asyncio.create_task(auto_delete_task())
                 }
                 
-                msg_lines = [f"🎬 **Multiple results found for '{movie_name}':**\n"]
-                buttons = []
-                number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
-                
-                for idx, t in enumerate(top_results):
-                    title = t.get("Title", "Unknown")
-                    seeders = t.get("Seeders", 0)
-                    size_str = format_size(t.get("Size", 0))
-                    num = number_emojis[idx] if idx < len(number_emojis) else f"{idx+1}."
-                    
-                    msg_lines.append(f"{num} `{title}`\n   📊 {seeders} seeders | 💾 {size_str}\n")
-                    btn_label = f"{num} {title[:35]}..." if len(title) > 38 else f"{num} {title}"
-                    buttons.append([Button.inline(btn_label, data=f"sel_{idx}".encode('utf-8'))])
-                
-                buttons.append([Button.inline("❌ Cancel", data=b"cancel")])
-                msg_lines.append("👇 **Tap a button above or reply with a number (1-5) to select:**")
-                
                 await reply_msg.edit(
-                    "\n".join(msg_lines),
+                    text_content,
                     buttons=buttons
                 )
                 return
@@ -429,10 +570,11 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             
             if downloaded_file:
                 filename = os.path.basename(downloaded_file)
-                await reply_msg.edit(
-                    f"✅ Successfully downloaded via Telegram fallback:\n`{filename}`\n\nSaved to: `{DOWNLOAD_DIR}`",
+                done_msg = await reply_msg.edit(
+                    f"✅ Successfully downloaded via Telegram fallback:\n`{filename}`\n\nSaved to: `{DOWNLOAD_DIR}`\n\n⏱️ *Message auto-deletes in 15 seconds.*",
                     buttons=None
                 )
+                asyncio.create_task(schedule_auto_delete(done_msg, 15))
                 return
 
             # 3. Spelling Suggestion Fallback
@@ -440,16 +582,18 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             suggestion = await get_spelling_suggestion(movie_name)
             
             if suggestion:
-                await reply_msg.edit(
+                err_msg = await reply_msg.edit(
                     f"❌ No matches found for **{movie_name}**.\n\nDid you mean: **{suggestion}**?\n"
-                    f"Please try searching again with the corrected name.",
+                    f"Please try searching again with the corrected name.\n\n⏱️ *Message auto-deletes in 30 seconds.*",
                     buttons=None
                 )
+                asyncio.create_task(schedule_auto_delete(err_msg, 30))
             else:
-                await reply_msg.edit(
-                    f"❌ No matches found for **{movie_name}** in Jackett or preconfigured Telegram channels.",
+                err_msg = await reply_msg.edit(
+                    f"❌ No matches found for **{movie_name}** in Jackett or preconfigured Telegram channels.\n\n⏱️ *Message auto-deletes in 30 seconds.*",
                     buttons=None
                 )
+                asyncio.create_task(schedule_auto_delete(err_msg, 30))
 
         except Exception as e:
             logging.exception("Error during command execution:")
