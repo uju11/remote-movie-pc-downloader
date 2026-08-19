@@ -131,15 +131,21 @@ class QBittorrentClient:
             response = await self.client.post(url, data=data)
             if response.status_code in (200, 202):
                 logging.info(f"Torrent successfully added to qBittorrent. Savepath: {save_path}")
-                return True
-            elif response.status_code in (403, 409):
-                logging.warning("qBittorrent returned authorization error. Re-authenticating...")
+                return "added"
+            elif response.status_code == 409:
+                logging.info(f"Torrent is already present in qBittorrent download list. Savepath: {save_path}")
+                return "exists"
+            elif response.status_code == 403:
+                logging.warning("qBittorrent returned authorization error (403). Re-authenticating...")
                 self.authenticated = False
                 if await self.login():
                     response = await self.client.post(url, data=data)
                     if response.status_code in (200, 202):
                         logging.info("Torrent successfully added after re-authentication.")
-                        return True
+                        return "added"
+                    elif response.status_code == 409:
+                        logging.info("Torrent is already present in qBittorrent download list.")
+                        return "exists"
             logging.error(f"Failed to add torrent to qBittorrent: Status {response.status_code}, Response: {response.text}")
             return False
         except Exception as e:
@@ -351,12 +357,18 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
         )
         
         qb = QBittorrentClient(QBITTORRENT_URL, QBITTORRENT_USERNAME, QBITTORRENT_PASSWORD)
-        success = await qb.add_torrent(magnet_link, DOWNLOAD_DIR)
+        result = await qb.add_torrent(magnet_link, DOWNLOAD_DIR)
         await qb.close()
         
-        if success:
+        if result == "added" or result is True:
             done_msg = await reply_msg.edit(
                 f"✅ Successfully added torrent to qBittorrent:\n`{title}`\n\nSaving to: `{DOWNLOAD_DIR}`\n\n⏱️ *Message auto-deletes in 15 seconds.*",
+                buttons=None
+            )
+            asyncio.create_task(schedule_auto_delete(done_msg, 15))
+        elif result == "exists":
+            done_msg = await reply_msg.edit(
+                f"ℹ️ Torrent is already present in qBittorrent queue:\n`{title}`\n\nSaving to: `{DOWNLOAD_DIR}`\n\n⏱️ *Message auto-deletes in 15 seconds.*",
                 buttons=None
             )
             asyncio.create_task(schedule_auto_delete(done_msg, 15))
@@ -641,12 +653,17 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             
             reply_msg = await event.reply("📥 Adding magnet link directly to qBittorrent...")
             qb = QBittorrentClient(QBITTORRENT_URL, QBITTORRENT_USERNAME, QBITTORRENT_PASSWORD)
-            success = await qb.add_torrent(magnet_link, DOWNLOAD_DIR)
+            result = await qb.add_torrent(magnet_link, DOWNLOAD_DIR)
             await qb.close()
             
-            if success:
+            if result == "added" or result is True:
                 done_msg = await reply_msg.edit(
                     f"✅ Magnet link successfully added to qBittorrent!\nSaving to: `{DOWNLOAD_DIR}`\n\n⏱️ *Message auto-deletes in 15 seconds.*"
+                )
+                asyncio.create_task(schedule_auto_delete(done_msg, 15))
+            elif result == "exists":
+                done_msg = await reply_msg.edit(
+                    f"ℹ️ Magnet link is already present in qBittorrent queue!\nSaving to: `{DOWNLOAD_DIR}`\n\n⏱️ *Message auto-deletes in 15 seconds.*"
                 )
                 asyncio.create_task(schedule_auto_delete(done_msg, 15))
             else:
