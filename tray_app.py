@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import shutil
+import ctypes
 import subprocess
 import webbrowser
 import threading
@@ -13,7 +14,35 @@ from PIL import Image, ImageDraw
 import pystray
 from pystray import MenuItem as item, Menu
 
+# Ensure UTF-8 stdout on Windows
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 APP_NAME = "MediaRemoteDownloader"
+
+_MUTEX_HANDLE = None
+
+def acquire_single_instance_lock():
+    global _MUTEX_HANDLE
+    if os.name != 'nt':
+        return True
+    try:
+        mutex_name = "Local\\MediaRemoteDownloader_SingleInstance_Mutex"
+        _MUTEX_HANDLE = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+        last_error = ctypes.windll.kernel32.GetLastError()
+        if not _MUTEX_HANDLE or last_error == 183:  # ERROR_ALREADY_EXISTS
+            return False
+        return True
+    except Exception:
+        return True
 
 # Determine project directory cleanly for both source execution and PyInstaller frozen binary
 if getattr(sys, 'frozen', False):
@@ -113,7 +142,7 @@ def is_docker_cli_available():
             ["docker", "--version"],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=5,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
         return res.returncode == 0
@@ -126,7 +155,7 @@ def is_docker_engine_running():
             ["docker", "info"],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=10,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
         return res.returncode == 0
@@ -142,7 +171,7 @@ def check_services_running():
             cwd=PROJECT_DIR,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=15,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
         )
         if result.returncode == 0 and ("media_downloader_bot" in result.stdout or "running" in result.stdout.lower()):
@@ -406,7 +435,7 @@ class TrayApp:
         def restart():
             if self.config.get("mode") == "docker":
                 subprocess.run(
-                    ["docker", "compose", "restart"],
+                    ["docker", "compose", "up", "-d", "--force-recreate"],
                     cwd=PROJECT_DIR,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
                 )
@@ -572,5 +601,15 @@ class TrayApp:
         self.icon.run()
 
 if __name__ == '__main__':
+    if not acquire_single_instance_lock():
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(APP_NAME, "Media Remote Downloader is already running in the system tray.")
+            root.destroy()
+        except Exception:
+            pass
+        sys.exit(0)
+
     app = TrayApp()
     app.run()

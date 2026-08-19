@@ -72,6 +72,9 @@ services:
     environment:
       - LOG_LEVEL=info
       - TZ=Asia/Kolkata
+      - CAPTCHA_SOLVER=none
+      - HEADLESS=true
+      - BROWSER_TIMEOUT=60000
     ports:
       - "8191:8191"
 

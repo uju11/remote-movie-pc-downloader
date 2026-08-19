@@ -149,13 +149,17 @@ class QBittorrentClient:
 async def fetch_single_jackett_query(client, url, q):
     try:
         params = {"apikey": JACKETT_API_KEY, "Query": q}
-        resp = await client.get(url, params=params, timeout=12.0)
+        resp = await client.get(url, params=params, timeout=75.0)
         if resp.status_code == 200:
             res = resp.json().get("Results", [])
             logging.info(f"Jackett query '{q}' returned {len(res)} results.")
             return res
+        else:
+            logging.error(f"Jackett returned status {resp.status_code} for query '{q}': {resp.text[:200]}")
+    except httpx.ReadTimeout:
+        logging.warning(f"Jackett query for '{q}' timed out after 75s (some slow indexers or challenges may have delayed response).")
     except Exception as e:
-        logging.error(f"Error querying Jackett for '{q}': {e}")
+        logging.error(f"Error querying Jackett for '{q}': {repr(e)}")
     return []
 
 async def search_jackett(movie_name: str, quality: str = None) -> list:
@@ -168,22 +172,17 @@ async def search_jackett(movie_name: str, quality: str = None) -> list:
 
     url = f"{JACKETT_URL}/api/v2.0/indexers/all/results"
     base_query = f"{movie_name} {quality}" if quality else movie_name
-    queries = [base_query]
-    
-    # If query is a general base title (e.g. 'Hotel Transylvania'), also search parts 1, 2, 3, 4 in parallel
-    if not re.search(r'\b(1|2|3|4|5|6|7|8|9|part|vol|chapter)\b', movie_name.lower()):
-        for sp in ["1", "2", "3", "4"]:
-            queries.append(f"{movie_name} {sp} {quality}" if quality else f"{movie_name} {sp}")
 
-    all_results = []
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        tasks = [fetch_single_jackett_query(client, url, q) for q in queries]
-        responses = await asyncio.gather(*tasks)
-        for r in responses:
-            all_results.extend(r)
+    async with httpx.AsyncClient(timeout=80.0) as client:
+        results = await fetch_single_jackett_query(client, url, base_query)
+        
+        # If quality was specified but returned no results, retry with just movie_name
+        if not results and quality:
+            logging.info(f"No results for '{base_query}'. Retrying Jackett search for base title '{movie_name}'...")
+            results = await fetch_single_jackett_query(client, url, movie_name)
 
-    logging.info(f"Total combined Jackett results: {len(all_results)}")
-    return all_results
+    logging.info(f"Total Jackett results for '{movie_name}': {len(results)}")
+    return results
 
 
 # --- DuckDuckGo Spelling Suggestions ---
