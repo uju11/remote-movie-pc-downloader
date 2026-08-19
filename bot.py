@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import logging
 import re
 import asyncio
@@ -401,6 +402,90 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             else:
                 msg = await event.edit("⚠️ Selection expired. Please search again.", buttons=None)
                 asyncio.create_task(schedule_auto_delete(msg, 5))
+
+    # --- Shared File / Forwarded Media Auto-Downloader ---
+    @client.on(events.NewMessage(func=lambda e: e.is_private and bool(e.file)))
+    async def handle_media_message(event):
+        """Auto-download any file shared/forwarded to Saved Messages."""
+        if me_id and event.sender_id != me_id:
+            return
+
+        file = event.message.file
+        # Derive a sensible filename
+        filename = (file.name or "").strip()
+        if not filename:
+            ext = ""
+            if file.mime_type:
+                ext_map = {
+                    "video/mp4": ".mp4", "video/x-matroska": ".mkv",
+                    "video/x-msvideo": ".avi", "video/quicktime": ".mov",
+                    "audio/mpeg": ".mp3", "audio/flac": ".flac",
+                    "audio/x-wav": ".wav", "application/zip": ".zip",
+                    "application/x-rar-compressed": ".rar",
+                    "application/pdf": ".pdf",
+                }
+                ext = ext_map.get(file.mime_type, "")
+            filename = f"telegram_{event.message.id}{ext}"
+
+        file_size = file.size or 0
+        logging.info(f"Auto-download triggered: '{filename}' ({format_size(file_size)})")
+
+        reply_msg = await event.reply(
+            f"📥 **File detected in Saved Messages!**\n"
+            f"📄 `{filename}`\n"
+            f"💾 Size: {format_size(file_size)}\n"
+            f"⏳ Starting download..."
+        )
+
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+        download_path = os.path.join(DOWNLOAD_DIR, filename)
+
+        last_pct = [0.0]
+        last_edit_ts = [0.0]
+
+        async def progress_callback(received, total):
+            if not total:
+                return
+            pct = (received / total) * 100
+            now = time.monotonic()
+            # Throttle edits: update every ~10% AND at least 4 s apart
+            if (pct - last_pct[0] >= 10.0 or received == total) and (now - last_edit_ts[0] >= 4.0):
+                last_pct[0] = pct
+                last_edit_ts[0] = now
+                bar_filled = int(pct / 10)
+                bar = "█" * bar_filled + "░" * (10 - bar_filled)
+                try:
+                    await reply_msg.edit(
+                        f"📥 **Downloading from Telegram...**\n"
+                        f"📄 `{filename}`\n"
+                        f"\n[{bar}] {pct:.1f}%\n"
+                        f"💾 {format_size(received)} / {format_size(file_size)}"
+                    )
+                except Exception:
+                    pass
+
+        try:
+            await client.download_media(
+                event.message,
+                file=download_path,
+                progress_callback=progress_callback
+            )
+            logging.info(f"Successfully downloaded shared media to {download_path}")
+            done_msg = await reply_msg.edit(
+                f"✅ **Download complete!**\n"
+                f"📄 `{filename}`\n"
+                f"💾 Size: {format_size(file_size)}\n"
+                f"📂 Saved to: `{DOWNLOAD_DIR}`\n\n"
+                f"⏱️ *This message auto-deletes in 15 seconds.*"
+            )
+            asyncio.create_task(schedule_auto_delete(done_msg, 15))
+        except Exception as e:
+            logging.error(f"Error auto-downloading shared media '{filename}': {e}")
+            await reply_msg.edit(
+                f"❌ **Download failed!**\n"
+                f"📄 `{filename}`\n"
+                f"Error: `{e}`"
+            )
 
     @client.on(events.NewMessage(pattern=r'(?i).+'))
     async def handle_new_message(event):
