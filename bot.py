@@ -455,7 +455,47 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         download_path = os.path.join(DOWNLOAD_DIR, filename)
 
-        last_pct = [0.0]
+        # --- Resume support ---
+        # Telethon's iter_download offset must be aligned to CHUNK_SIZE (512 KB).
+        # Any extra bytes beyond the aligned boundary are truncated and re-downloaded.
+        CHUNK_SIZE = 512 * 1024  # 512 KB — matches Telethon's default request_size
+
+        existing_bytes = os.path.getsize(download_path) if os.path.exists(download_path) else 0
+        resume_offset = (existing_bytes // CHUNK_SIZE) * CHUNK_SIZE  # align down
+
+        if file_size and resume_offset >= file_size:
+            # File is already fully present on disk
+            ACTIVE_DOWNLOADS.pop(chat_id, None)
+            logging.info(f"File already complete on disk: {download_path}")
+            done_msg = await reply_msg.edit(
+                f"\u2705 **Already downloaded!**\n"
+                f"\ud83d\udcc4 `{filename}`\n"
+                f"\ud83d\udcbe Size: {format_size(file_size)}\n"
+                f"\ud83d\udcc2 Saved to: `{DOWNLOAD_DIR}`\n\n"
+                f"\u23f1\ufe0f *This message auto-deletes in 15 seconds.*"
+            )
+            asyncio.create_task(schedule_auto_delete(done_msg, 15))
+            return
+
+        if resume_offset > 0:
+            logging.info(
+                f"Resuming '{filename}' from {format_size(resume_offset)} "
+                f"(had {format_size(existing_bytes)}, aligned to chunk boundary)"
+            )
+            await reply_msg.edit(
+                f"\u23e9 **Resuming download...**\n"
+                f"\ud83d\udcc4 `{filename}`\n"
+                f"\ud83d\udcbe Already downloaded: {format_size(resume_offset)} / {format_size(file_size)} "
+                f"({resume_offset / file_size * 100:.1f}%)\n"
+                f"\u23f3 Continuing... (send `status` anytime)"
+            )
+
+        # Update tracker with resume starting point
+        ACTIVE_DOWNLOADS[chat_id]["received"] = resume_offset
+        ACTIVE_DOWNLOADS[chat_id]["pct"] = (resume_offset / file_size * 100) if file_size else 0.0
+
+        # Progress callback — called manually in the iter_download loop below
+        last_pct = [ACTIVE_DOWNLOADS[chat_id]["pct"]]
         last_log_ts = [0.0]
         last_edit_ts = [0.0]
 
@@ -470,7 +510,7 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
                 ACTIVE_DOWNLOADS[chat_id]["received"] = received
                 ACTIVE_DOWNLOADS[chat_id]["pct"] = pct
 
-            # Log to activity log every 5% OR every 30 seconds — whichever fires first
+            # Log every 5% OR every 30 s — whichever fires first
             should_log = (pct - last_pct[0] >= 5.0 or now - last_log_ts[0] >= 30.0 or received == total)
             # Throttle Telegram message edits to once every 5 s (avoid FloodWait)
             should_edit = should_log and (now - last_edit_ts[0] >= 5.0)
@@ -479,46 +519,64 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
                 last_pct[0] = pct
                 last_log_ts[0] = now
                 bar_filled = int(pct / 10)
-                bar = "█" * bar_filled + "░" * (10 - bar_filled)
+                bar = "\u2588" * bar_filled + "\u2591" * (10 - bar_filled)
                 logging.info(
-                    f"Telegram DL [{bar}] {pct:.1f}% — "
+                    f"Telegram DL [{bar}] {pct:.1f}% \u2014 "
                     f"{format_size(received)} / {format_size(file_size)}  '{filename}'"
                 )
                 if should_edit:
                     last_edit_ts[0] = now
+                    resume_note = f" *(resumed from {format_size(resume_offset)})*" if resume_offset > 0 else ""
                     try:
                         await reply_msg.edit(
-                            f"📥 **Downloading from Telegram...**\n"
-                            f"📄 `{filename}`\n"
+                            f"\ud83d\udce5 **Downloading from Telegram...**{resume_note}\n"
+                            f"\ud83d\udcc4 `{filename}`\n"
                             f"\n[{bar}] {pct:.1f}%\n"
-                            f"💾 {format_size(received)} / {format_size(file_size)}"
+                            f"\ud83d\udcbe {format_size(received)} / {format_size(file_size)}"
                         )
                     except Exception as edit_err:
                         logging.warning(f"Could not update progress message: {edit_err}")
 
         try:
-            await client.download_media(
-                event.message,
-                file=download_path,
-                progress_callback=progress_callback
-            )
+            # Open file: truncate-to-aligned-boundary if resuming, else create fresh
+            if resume_offset > 0:
+                with open(download_path, 'r+b') as f:
+                    f.seek(resume_offset)
+                    f.truncate()
+            file_handle = open(download_path, 'ab' if resume_offset > 0 else 'wb')
+
+            received_total = resume_offset
+            try:
+                async for chunk in client.iter_download(
+                    event.message,
+                    offset=resume_offset,
+                    request_size=CHUNK_SIZE,
+                    file_size=file_size,
+                ):
+                    file_handle.write(chunk)
+                    received_total += len(chunk)
+                    await progress_callback(received_total, file_size)
+            finally:
+                file_handle.close()
+
             ACTIVE_DOWNLOADS.pop(chat_id, None)
-            logging.info(f"Successfully downloaded shared media to {download_path}")
+            logging.info(f"Successfully downloaded to {download_path}")
             done_msg = await reply_msg.edit(
-                f"✅ **Download complete!**\n"
-                f"📄 `{filename}`\n"
-                f"💾 Size: {format_size(file_size)}\n"
-                f"📂 Saved to: `{DOWNLOAD_DIR}`\n\n"
-                f"⏱️ *This message auto-deletes in 15 seconds.*"
+                f"\u2705 **Download complete!**\n"
+                f"\ud83d\udcc4 `{filename}`\n"
+                f"\ud83d\udcbe Size: {format_size(file_size)}\n"
+                f"\ud83d\udcc2 Saved to: `{DOWNLOAD_DIR}`\n\n"
+                f"\u23f1\ufe0f *This message auto-deletes in 15 seconds.*"
             )
             asyncio.create_task(schedule_auto_delete(done_msg, 15))
         except Exception as e:
             ACTIVE_DOWNLOADS.pop(chat_id, None)
-            logging.error(f"Error auto-downloading shared media '{filename}': {e}")
+            logging.error(f"Error downloading '{filename}': {e}")
             await reply_msg.edit(
-                f"❌ **Download failed!**\n"
-                f"📄 `{filename}`\n"
-                f"Error: `{e}`"
+                f"\u274c **Download failed!**\n"
+                f"\ud83d\udcc4 `{filename}`\n"
+                f"Error: `{e}`\n\n"
+                f"\ud83d\udca1 Partial file kept at `{download_path}` \u2014 re-forward the file to resume."
             )
 
     @client.on(events.NewMessage(pattern=r'(?i).+'))
