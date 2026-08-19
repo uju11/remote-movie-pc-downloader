@@ -441,6 +441,7 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
         download_path = os.path.join(DOWNLOAD_DIR, filename)
 
         last_pct = [0.0]
+        last_log_ts = [0.0]
         last_edit_ts = [0.0]
 
         async def progress_callback(received, total):
@@ -448,25 +449,32 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
                 return
             pct = (received / total) * 100
             now = time.monotonic()
-            # Throttle edits: update every ~10% AND at least 4 s apart
-            if (pct - last_pct[0] >= 10.0 or received == total) and (now - last_edit_ts[0] >= 4.0):
+
+            # Log to activity log every 5% OR every 30 seconds — whichever fires first
+            should_log = (pct - last_pct[0] >= 5.0 or now - last_log_ts[0] >= 30.0 or received == total)
+            # Throttle Telegram message edits to once every 5 s (avoid FloodWait)
+            should_edit = should_log and (now - last_edit_ts[0] >= 5.0)
+
+            if should_log:
                 last_pct[0] = pct
-                last_edit_ts[0] = now
+                last_log_ts[0] = now
                 bar_filled = int(pct / 10)
                 bar = "█" * bar_filled + "░" * (10 - bar_filled)
                 logging.info(
                     f"Telegram DL [{bar}] {pct:.1f}% — "
                     f"{format_size(received)} / {format_size(file_size)}  '{filename}'"
                 )
-                try:
-                    await reply_msg.edit(
-                        f"📥 **Downloading from Telegram...**\n"
-                        f"📄 `{filename}`\n"
-                        f"\n[{bar}] {pct:.1f}%\n"
-                        f"💾 {format_size(received)} / {format_size(file_size)}"
-                    )
-                except Exception as edit_err:
-                    logging.warning(f"Could not update progress message: {edit_err}")
+                if should_edit:
+                    last_edit_ts[0] = now
+                    try:
+                        await reply_msg.edit(
+                            f"📥 **Downloading from Telegram...**\n"
+                            f"📄 `{filename}`\n"
+                            f"\n[{bar}] {pct:.1f}%\n"
+                            f"💾 {format_size(received)} / {format_size(file_size)}"
+                        )
+                    except Exception as edit_err:
+                        logging.warning(f"Could not update progress message: {edit_err}")
 
         try:
             await client.download_media(
