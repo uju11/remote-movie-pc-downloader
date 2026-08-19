@@ -454,6 +454,10 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
                 last_edit_ts[0] = now
                 bar_filled = int(pct / 10)
                 bar = "█" * bar_filled + "░" * (10 - bar_filled)
+                logging.info(
+                    f"Telegram DL [{bar}] {pct:.1f}% — "
+                    f"{format_size(received)} / {format_size(file_size)}  '{filename}'"
+                )
                 try:
                     await reply_msg.edit(
                         f"📥 **Downloading from Telegram...**\n"
@@ -461,8 +465,8 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
                         f"\n[{bar}] {pct:.1f}%\n"
                         f"💾 {format_size(received)} / {format_size(file_size)}"
                     )
-                except Exception:
-                    pass
+                except Exception as edit_err:
+                    logging.warning(f"Could not update progress message: {edit_err}")
 
         try:
             await client.download_media(
