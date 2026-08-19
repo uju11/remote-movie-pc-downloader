@@ -14,6 +14,10 @@ load_dotenv()
 # Pending interactive search selections map
 PENDING_SEARCHES = {}
 
+# Active Telegram media downloads tracker
+# { chat_id: { filename, file_size, received, started_at, pct } }
+ACTIVE_DOWNLOADS = {}
+
 def format_size(size_bytes: int) -> str:
     if not size_bytes:
         return ""
@@ -428,13 +432,24 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             filename = f"telegram_{event.message.id}{ext}"
 
         file_size = file.size or 0
+        chat_id = event.chat_id
+        started_at = time.monotonic()
         logging.info(f"Auto-download triggered: '{filename}' ({format_size(file_size)})")
+
+        # Register in global tracker so /status can query it
+        ACTIVE_DOWNLOADS[chat_id] = {
+            "filename": filename,
+            "file_size": file_size,
+            "received": 0,
+            "pct": 0.0,
+            "started_at": started_at,
+        }
 
         reply_msg = await event.reply(
             f"📥 **File detected in Saved Messages!**\n"
             f"📄 `{filename}`\n"
             f"💾 Size: {format_size(file_size)}\n"
-            f"⏳ Starting download..."
+            f"⏳ Starting download... (send `status` anytime for a progress update)"
         )
 
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -449,6 +464,11 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
                 return
             pct = (received / total) * 100
             now = time.monotonic()
+
+            # Always keep global tracker up-to-date (used by /status)
+            if chat_id in ACTIVE_DOWNLOADS:
+                ACTIVE_DOWNLOADS[chat_id]["received"] = received
+                ACTIVE_DOWNLOADS[chat_id]["pct"] = pct
 
             # Log to activity log every 5% OR every 30 seconds — whichever fires first
             should_log = (pct - last_pct[0] >= 5.0 or now - last_log_ts[0] >= 30.0 or received == total)
@@ -482,6 +502,7 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
                 file=download_path,
                 progress_callback=progress_callback
             )
+            ACTIVE_DOWNLOADS.pop(chat_id, None)
             logging.info(f"Successfully downloaded shared media to {download_path}")
             done_msg = await reply_msg.edit(
                 f"✅ **Download complete!**\n"
@@ -492,6 +513,7 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
             )
             asyncio.create_task(schedule_auto_delete(done_msg, 15))
         except Exception as e:
+            ACTIVE_DOWNLOADS.pop(chat_id, None)
             logging.error(f"Error auto-downloading shared media '{filename}': {e}")
             await reply_msg.edit(
                 f"❌ **Download failed!**\n"
@@ -513,7 +535,45 @@ def setup_handlers(client: TelegramClient, me_id: int = None):
 
         chat_id = event.chat_id
 
-        # 0. DIRECT MAGNET LINK SUPPORT: e.g. "/magnet ::: magnet:?xt=..." or "magnet:?xt=..."
+        # 0a. STATUS CHECK — send "status" or "/status" to get live download progress
+        if text.lower().strip() in ("status", "/status", "progress", "/progress"):
+            if chat_id in ACTIVE_DOWNLOADS:
+                dl = ACTIVE_DOWNLOADS[chat_id]
+                pct = dl["pct"]
+                received = dl["received"]
+                file_size = dl["file_size"]
+                filename = dl["filename"]
+                elapsed = time.monotonic() - dl["started_at"]
+                bar_filled = int(pct / 10)
+                bar = "█" * bar_filled + "░" * (10 - bar_filled)
+                elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+                # Estimate remaining time
+                if received > 0 and file_size > received:
+                    speed = received / elapsed  # bytes/s
+                    remaining_bytes = file_size - received
+                    eta_s = remaining_bytes / speed
+                    eta_str = f"{int(eta_s // 60)}m {int(eta_s % 60)}s"
+                else:
+                    eta_str = "calculating..."
+                status_msg = await event.reply(
+                    f"📊 **Download Status**\n"
+                    f"📄 `{filename}`\n\n"
+                    f"[{bar}] **{pct:.1f}%**\n"
+                    f"💾 {format_size(received)} / {format_size(file_size)}\n"
+                    f"⏱️ Elapsed: {elapsed_str}\n"
+                    f"⏳ ETA: ~{eta_str}"
+                )
+                asyncio.create_task(schedule_auto_delete(status_msg, 30))
+            else:
+                status_msg = await event.reply("✅ No active downloads right now.")
+                asyncio.create_task(schedule_auto_delete(status_msg, 10))
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            return
+
+        # 0b. DIRECT MAGNET LINK SUPPORT: e.g. "/magnet ::: magnet:?xt=..." or "magnet:?xt=..."
         if "magnet:?xt=" in text or text.startswith("/magnet"):
             magnet_link = text
             if ":::" in text:
